@@ -1751,6 +1751,8 @@ el.dropzone.addEventListener('drop', (e) => {
 el.fileInput.addEventListener('change', (e) => {
     const files = Array.from(e.target.files || []);
     el.fileInput.value = '';
+    autoFsDeclined = false;
+    if (files.length === 1) autoFullscreen();
     handlePickedFiles(files);
 });
 
@@ -2206,6 +2208,34 @@ async function toggleFullscreen() {
     } catch (e) { showToast('A teljes képernyős mód nem váltható: ' + e.message); }
 }
 
+// Telefonon / tableten a könyv megnyitásakor magától teljes képernyőre váltunk.
+// A böngésző ezt csak koppintásra engedi, ezért koppintáskor kérjük.
+const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+let autoFsDeclined = false;   // ha a felhasználó kilépett, nem erőltetjük vissza
+function realFullscreen() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+function autoFullscreen() {
+    if (!isTouchDevice || autoFsDeclined || realFullscreen()) return;
+    if (window.matchMedia && matchMedia('(display-mode: fullscreen)').matches) return;
+    const root = document.documentElement;
+    const request = root.requestFullscreen || root.webkitRequestFullscreen;
+    if (!request) return;
+    try {
+        const r = request.call(root, { navigationUI: 'hide' });
+        if (r && r.catch) r.catch(() => { /* majd a következő koppintásra */ });
+    } catch (e) { /* nem baj */ }
+}
+// Ha a könyv már nyitva van, de nem teljes képernyős: az első koppintásra váltunk
+function autoFullscreenOnTap(e) {
+    if (!document.body.classList.contains('book-open')) return;
+    if (e.target && e.target.closest && e.target.closest('#btn-fullscreen, #fs-exit, #btn-close')) return;
+    autoFullscreen();
+}
+document.addEventListener('touchend', autoFullscreenOnTap, { capture: true, passive: true });
+document.addEventListener('click', autoFullscreenOnTap, true);
+// Ha a teljes képernyő megszűnik nyitott könyvnél (Vissza gomb, ⛶), ne kérjük újra
+document.addEventListener('fullscreenchange', () => { if (!realFullscreen() && document.body.classList.contains('book-open')) autoFsDeclined = true; });
+document.addEventListener('webkitfullscreenchange', () => { if (!realFullscreen() && document.body.classList.contains('book-open')) autoFsDeclined = true; });
+
 let uiHideTimer = null;
 function startUiAutoHide() {
     clearTimeout(uiHideTimer);
@@ -2325,7 +2355,7 @@ function renderLibrary() {
         const pos = parseInt(lsGet('book-pos-' + item.id), 10);
         div.querySelector('.lib-name').textContent = item.name.replace(/\.pdf$/i, '');
         div.querySelector('.lib-meta').textContent = formatSize(item.size) + (pos > 1 ? ` · a(z) ${pos}. oldalnál tartasz` : '');
-        const open = () => loadPdfFile(item.file, item.name);
+        const open = () => { autoFsDeclined = false; autoFullscreen(); loadPdfFile(item.file, item.name); };
         div.addEventListener('click', open);
         div.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
         div.querySelector('.lib-remove').addEventListener('click', (e) => {
