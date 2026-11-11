@@ -1102,8 +1102,40 @@ body.is-fullscreen.book-open #fs-exit { display: inline-flex; }
 // ÁLLAPOT
 // ============================================================
 const MIN_PAGE_W = 300;     // ennél keskenyebb két oldal esetén egyoldalas nézet
-const RENDER_RANGE = 2;     // ennyi oldalt rajzolunk elő a jelenlegi körül
-const KEEP_RANGE = 6;      // ennél messzebbi oldalak képét eldobjuk (memória)
+const RENDER_AHEAD = 4;     // ennyi következő oldalt rajzolunk elő
+const RENDER_BEHIND = 2;    // ennyi előző oldalt rajzolunk elő
+const KEEP_RANGE = 8;       // ennél messzebbi oldalak képét eldobjuk (memória)
+
+// PDF-feldolgozás külön háttérszálon, hogy a lapozás ne akadjon.
+// Ha a készülék ezt nem tudja, marad a régi mód (minden egy szálon).
+const pdfWorkerReady = (function startPdfWorker() {
+    return new Promise((resolve) => {
+        try {
+            const src = document.getElementById('pdf-worker-src');
+            if (!src || typeof Worker === 'undefined' || !window.Blob || !window.URL) return resolve(false);
+            const url = URL.createObjectURL(new Blob([src.textContent], { type: 'text/javascript' }));
+            const w = new Worker(url);
+            let done = false;
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                w.removeEventListener('message', onMsg);
+                if (ok && typeof pdfjsLib !== 'undefined') {
+                    pdfjsLib.GlobalWorkerOptions.workerPort = w;
+                } else {
+                    try { w.terminate(); } catch (e) { /* nem baj */ }
+                }
+                resolve(!!ok);
+            };
+            const onMsg = (e) => {
+                if (e.data && e.data.sourceName === 'worker' && e.data.action === 'ready') finish(true);
+            };
+            w.addEventListener('message', onMsg);
+            w.addEventListener('error', () => finish(false));
+            setTimeout(() => finish(false), 5000);
+        } catch (e) { resolve(false); }
+    });
+})();
 
 const state = {
     pdf: null,
@@ -1310,6 +1342,7 @@ async function loadPdfFile(file, name) {
 
 async function openPdf(buf, filename) {
     const size = buf.byteLength;
+    await pdfWorkerReady;
     // isEvalSupported: false — biztonsági beállítás (betűtípus-kód nem futtatható)
     const task = pdfjsLib.getDocument({ data: new Uint8Array(buf), isEvalSupported: false });
     task.onProgress = (p) => {
@@ -1640,14 +1673,20 @@ function targetPixelWidth() {
 async function renderAround(center) {
     const gen = ++state.renderGen;
     const target = targetPixelWidth();
-    const order = [];
-    for (let d = 0; d <= RENDER_RANGE; d++) {
-        order.push(center + d);
-        if (d) order.push(center - d);
-    }
+    // Sorrend: a látható oldalak, aztán a következők, aztán az előzők.
+    // Két oldalas nézetben a következő lapozáskor center+2 és center+3 jön elő.
+    const vis = visiblePdfPages();
+    const order = vis.length ? vis.slice() : [center];
+    for (let d = 1; d <= RENDER_AHEAD + 1; d++) order.push(center + d);
+    for (let d = 1; d <= RENDER_BEHIND; d++) order.push(center - d);
+    const seen = new Set();
     for (const p of order) {
         if (gen !== state.renderGen) return;
-        if (p < 1 || p > state.totalPages) continue;
+        if (p < 1 || p > state.totalPages || seen.has(p)) continue;
+        seen.add(p);
+        // Nem látható oldalt lapozás közben nem rajzolunk, hogy az animáció ne akadjon
+        if (!vis.includes(p)) await waitUntilIdle(gen);
+        if (gen !== state.renderGen) return;
         try { await ensureRendered(p, target); } catch (e) { console.warn('Render hiba', p, e); }
     }
     // Messzi oldalak képének eldobása
@@ -1658,6 +1697,18 @@ async function renderAround(center) {
             const img = state.pageImgs[p];
             if (img) { img.classList.remove('ready'); img.removeAttribute('src'); }
         }
+    }
+}
+
+/** Megvárja, amíg épp nem lapoz senki (legfeljebb kb. 3 mp-ig). */
+async function waitUntilIdle(gen) {
+    for (let i = 0; i < 30; i++) {
+        const pf = state.pageFlip;
+        if (!pf || gen !== state.renderGen) return;
+        let s = 'read';
+        try { s = pf.getState(); } catch (e) { /* nem baj */ }
+        if (s === 'read') return;
+        await new Promise(r => setTimeout(r, 100));
     }
 }
 
