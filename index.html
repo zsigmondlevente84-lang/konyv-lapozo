@@ -965,6 +965,25 @@ body.is-fullscreen #stage { inset: 0; }
 #fs-exit:hover { background: var(--gold); color: var(--desk-dark); }
 body.is-fullscreen.book-open #fs-exit { display: inline-flex; }
 
+/* Jól látható gomb, ha a könyv nyitva van, de a teljes képernyő nem kapcsolt be */
+#fs-enter {
+    position: fixed;
+    top: calc(66px + env(safe-area-inset-top));
+    right: max(12px, env(safe-area-inset-right));
+    z-index: 55;
+    display: none;
+    align-items: center; gap: 0.4rem;
+    padding: 0.5rem 1rem;
+    border-radius: 30px;
+    background: rgba(18, 11, 5, 0.85);
+    color: var(--gold-bright);
+    border: 1px solid var(--gold);
+    font-family: 'IM Fell English', serif; font-size: 1.05rem;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+body.book-open.offer-fs:not(.is-fullscreen) #fs-enter { display: inline-flex; }
+
 .hidden-el { display: none !important; }
 </style>
 </head>
@@ -997,6 +1016,7 @@ body.is-fullscreen.book-open #fs-exit { display: inline-flex; }
 </div>
 
 <button id="fs-exit" type="button" title="Kilépés a teljes képernyőből, vissza a könyvekhez">✕ Kilépés</button>
+<button id="fs-enter" type="button" title="Teljes képernyő">⛶ Teljes képernyő</button>
 
 <!-- ===== FELSŐ SÁV ===== -->
 <div id="toolbar" class="hidden-el">
@@ -1470,7 +1490,7 @@ function buildBook() {
     state.bookCount = pages.length;
 
     // Méretezés, mielőtt a lapozó elindul
-    layoutBook();
+    const lay = layoutBook();
 
     // Hol hagytuk abba legutóbb?
     let start = 0;
@@ -1484,7 +1504,7 @@ function buildBook() {
         width: 500,
         height: Math.round(500 / state.pageRatio),
         size: 'stretch',
-        minWidth: Math.min(MIN_PAGE_W, Math.max(80, el.bookWrap.clientWidth)),
+        minWidth: flipMinWidth(lay.w, lay.twoPages),
         maxWidth: 5000,
         minHeight: 100,
         maxHeight: 5000,
@@ -1519,6 +1539,8 @@ function buildBook() {
     pf.update();
     if (start) pf.turnToPage(start);
     onPageChanged();
+    // Ha a képernyő mérete közben még változik (teljes képernyő, címsor), utána újra igazítunk
+    relayoutSoon();
 }
 
 /** A lapozás egy kemény borítót mozgat? (más hangja van) */
@@ -1549,16 +1571,27 @@ function layoutBook() {
     const ah = Math.max(100, el.stage.clientHeight - padY * 2);
     const r = state.pageRatio;
 
+    // Két oldal egymás mellett csak akkor, ha így sem lesz sokkal kisebb egy oldal,
+    // mint egyoldalas nézetben (álló tableten / telefonon így egy nagy oldal látszik).
     const landscapeW = Math.min(aw, 2 * ah * r);
-    const w = landscapeW >= 2 * MIN_PAGE_W ? landscapeW : Math.min(aw, ah * r);
+    const singleW = Math.min(aw, ah * r);
+    const twoPages = landscapeW / 2 >= MIN_PAGE_W && landscapeW / 2 >= singleW * 0.8;
+    const w = Math.floor(twoPages ? landscapeW : singleW);
 
-    el.bookWrap.style.width = Math.floor(w) + 'px';
+    el.bookWrap.style.width = w + 'px';
     const book = $('book');
     if (book) {
         book.style.width = '100%';
-        book.style.maxWidth = Math.floor(w) + 'px';
-        book.style.minWidth = Math.min(Math.floor(w), MIN_PAGE_W) + 'px';
+        book.style.maxWidth = w + 'px';
+        book.style.minWidth = Math.min(w, MIN_PAGE_W) + 'px';
     }
+    // A lapozó a minWidth alapján dönt: ha a könyv keskenyebb 2 × minWidth-nél, egy oldalt mutat
+    if (state.pageFlip) state.pageFlip.getSettings().minWidth = flipMinWidth(w, twoPages);
+    return { w, twoPages };
+}
+
+function flipMinWidth(w, twoPages) {
+    return twoPages ? Math.max(50, Math.min(MIN_PAGE_W, Math.floor(w / 2) - 2)) : Math.ceil(w / 2) + 2;
 }
 
 /** A látható PDF oldalak listája. */
@@ -1608,6 +1641,25 @@ function refreshAfterFlip() {
 
     renderAround(center);
     requestAnimationFrame(updateDecor);
+    setTimeout(sharpenVisible, 80);
+}
+
+/**
+ * Lapozás után a böngésző néha az animáció közbeni, elmosódott képet hagyja a lapon.
+ * Egy apró, láthatatlan változtatással kikényszerítjük az éles újrarajzolást.
+ */
+function sharpenVisible() {
+    const pf = state.pageFlip;
+    if (!pf) return;
+    let s = 'read';
+    try { s = pf.getState(); } catch (e) { /* nem baj */ }
+    if (s !== 'read') { setTimeout(sharpenVisible, 120); return; }
+    visiblePdfPages().forEach(p => {
+        const img = state.pageImgs[p];
+        if (!img) return;
+        img.style.transform = 'translateZ(0)';
+        requestAnimationFrame(() => requestAnimationFrame(() => { img.style.transform = ''; }));
+    });
 }
 
 /** A kötéstábla és a lapélek elhelyezése a könyv körül. */
@@ -1667,7 +1719,9 @@ function targetPixelWidth() {
     const pf = state.pageFlip;
     const rect = pf && pf.getBoundsRect();
     const pw = rect ? rect.pageWidth : 400;
-    return Math.min(1600, Math.round(pw * Math.min(window.devicePixelRatio || 1, 2)));
+    // A kijelző valódi képpontsűrűsége (tableten gyakran 2–3), plusz 25% tartalék az élességért
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    return Math.min(2400, Math.round(pw * dpr * 1.25));
 }
 
 async function renderAround(center) {
@@ -1720,7 +1774,11 @@ async function ensureRendered(p, target) {
     const job = (async () => {
         const page = await state.pdf.getPage(p);
         const vp1 = page.getViewport({ scale: 1 });
-        const vp = page.getViewport({ scale: target / vp1.width });
+        // Legfeljebb kb. 12 millió képpont (régebbi iPhone / iPad ennél nagyobb képet nem tud rajzolni)
+        let scale = target / vp1.width;
+        const maxScale = Math.sqrt(12e6 / (vp1.width * vp1.height));
+        if (scale > maxScale) scale = maxScale;
+        const vp = page.getViewport({ scale });
         const canvas = document.createElement('canvas');
         canvas.width = Math.max(1, Math.round(vp.width));
         canvas.height = Math.round(vp.height);
@@ -1728,7 +1786,7 @@ async function ensureRendered(p, target) {
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         await page.render({ canvasContext: ctx, viewport: vp }).promise;
-        const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.9));
+        const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.95));
         if (!blob) throw new Error('Az oldal képe nem hozható létre.');
         canvas.width = canvas.height = 0;
         const url = URL.createObjectURL(blob);
@@ -2278,9 +2336,31 @@ function autoFullscreen() {
 // Ha a könyv már nyitva van, de nem teljes képernyős: az első koppintásra váltunk
 function autoFullscreenOnTap(e) {
     if (!document.body.classList.contains('book-open')) return;
-    if (e.target && e.target.closest && e.target.closest('#btn-fullscreen, #fs-exit, #btn-close')) return;
+    if (e.target && e.target.closest && e.target.closest('#btn-fullscreen, #fs-exit, #fs-enter, #btn-close')) return;
     autoFullscreen();
 }
+
+// „⛶ Teljes képernyő” gomb: csak ott látszik, ahol a böngésző tud teljes képernyőre váltani
+(function setupFsEnter() {
+    const root = document.documentElement;
+    const canRequest = !!(root.requestFullscreen || root.webkitRequestFullscreen);
+    const pwaFullscreen = window.matchMedia && matchMedia('(display-mode: fullscreen)').matches;
+    if (isTouchDevice && canRequest && !pwaFullscreen) document.body.classList.add('offer-fs');
+    $('fs-enter').addEventListener('click', () => {
+        autoFsDeclined = false;
+        if (!realFullscreen()) toggleFullscreen();
+    });
+})();
+
+/** A könyv újraméretezése többször egymás után (a böngésző a végleges méretet néha késve adja meg). */
+function relayoutSoon() {
+    if (!state.pageFlip) return;
+    [0, 300, 800].forEach(ms => setTimeout(() => window.dispatchEvent(new Event('resize')), ms));
+}
+// Visszatérés az alkalmazásba, elforgatás, címsor eltűnése után is igazítunk
+document.addEventListener('visibilitychange', () => { if (!document.hidden) relayoutSoon(); });
+window.addEventListener('pageshow', relayoutSoon);
+window.addEventListener('orientationchange', relayoutSoon);
 document.addEventListener('touchend', autoFullscreenOnTap, { capture: true, passive: true });
 document.addEventListener('click', autoFullscreenOnTap, true);
 // Ha a teljes képernyő megszűnik nyitott könyvnél (Vissza gomb, ⛶), ne kérjük újra
